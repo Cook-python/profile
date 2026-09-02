@@ -46,7 +46,7 @@ jobs:
           AREA_LABEL: 東京
           LATITUDE: "35.68"
           LONGITUDE: "139.77"
-          BIO_FIXED: 天気と防災が好きです
+          BIO_FIXED: 最近めっちゃ浮上してまぁす
           NOTICE_TEXT: pythonによって自動更新されています
           PRESENCE_WINDOW: "900"
           PRESENCE_ONLINE: オンライン
