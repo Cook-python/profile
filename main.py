@@ -50,6 +50,9 @@ WARNING_URL = "https://www.jma.go.jp/bosai/warning/data/warning/%s.json" % AREA_
 OPENMETEO_URL = "https://api.open-meteo.com/v1/forecast"
 QUAKE_URL = "https://api.p2pquake.net/v2/history?codes=551&limit=30"
 TSUNAMI_URL = "https://api.p2pquake.net/v2/history?codes=552&limit=1"
+SCRATCH_USER_URL = "https://api.scratch.mit.edu/users/%s/" % USERNAME
+SCRATCH_SITEAPI_URL = "https://scratch.mit.edu/site-api/users/all/%s/" % USERNAME
+SCRATCH_CSRF_URL = "https://scratch.mit.edu/csrf_token/"
 SCRATCH_FOLLOWERS_URL = "https://api.scratch.mit.edu/users/%s/followers/?limit=1" % USERNAME
 SCRATCH_MESSAGES_URL = "https://api.scratch.mit.edu/users/%s/messages/count/" % USERNAME
 SCRATCH_PROJECTS_URL = "https://api.scratch.mit.edu/users/%s/projects/" % USERNAME
@@ -652,31 +655,95 @@ def get_scratch_user():
     raise RuntimeError("cannot resolve linked user")
 
 
-def set_bio(user, text):
-    if DRY_RUN or user is None:
-        log("dry-run bio(%d): %s" % (clen(text), text.replace("\n", " | ")))
-        return True
-    try:
-        user.set_bio(text)
-        return True
-    except Exception as exc:
-        log("set_bio fail: %s" % exc)
-        return False
+def describe_error(exc):
+    res = getattr(exc, "response", None)
+    if res is not None:
+        body = (res.text or "")[:200].replace("\n", " ")
+        return "%s: HTTP %s %s" % (type(exc).__name__, res.status_code, body)
+    return "%s: %s" % (type(exc).__name__, exc)
 
 
-def set_status(user, text):
-    if DRY_RUN or user is None:
-        log("dry-run wiwo(%d): %s" % (clen(text), text.replace("\n", " | ")))
-        return True
-    try:
+def scratch_http_session():
+    token = SESSION_ID.strip()
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": UA,
+        "Referer": "https://scratch.mit.edu/users/%s/" % USERNAME,
+        "Origin": "https://scratch.mit.edu",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+    s.cookies.set("scratchsessionsid", token, domain=".scratch.mit.edu", path="/")
+    s.cookies.set("scratchlanguage", "en", domain=".scratch.mit.edu", path="/")
+    res = s.get(SCRATCH_CSRF_URL, timeout=15)
+    res.raise_for_status()
+    csrf = s.cookies.get("scratchcsrftoken") or ""
+    if not csrf:
+        raise RuntimeError("csrf token not issued (session id may be invalid)")
+    s.headers["X-CSRFToken"] = csrf
+    return s
+
+
+def write_field_direct(field, text):
+    s = scratch_http_session()
+    res = s.put(SCRATCH_SITEAPI_URL, json={field: text}, timeout=20)
+    res.raise_for_status()
+    return True
+
+
+def write_field(user, field, text):
+    method = "set_bio" if field == "bio" else "set_wiwo"
+    if user is not None:
         try:
-            user.set_wiwo(text)
-        except AttributeError:
-            user.set_work(text)
-        return True
+            fn = getattr(user, method, None) or getattr(user, "set_work", None)
+            if fn is None:
+                raise RuntimeError("scratchattach has no %s" % method)
+            fn(text)
+            return "scratchattach"
+        except Exception as exc:
+            log("%s via scratchattach failed -> %s" % (field, describe_error(exc)))
+    try:
+        write_field_direct(field, text)
+        return "site-api"
     except Exception as exc:
-        log("set_wiwo fail: %s" % exc)
+        log("%s via site-api failed -> %s" % (field, describe_error(exc)))
+    return ""
+
+
+def read_profile():
+    data = get_json(SCRATCH_USER_URL)
+    profile = data.get("profile") or {}
+    return {"bio": profile.get("bio", ""), "status": profile.get("status", "")}
+
+
+def verify_field(field, expected):
+    key = "bio" if field == "bio" else "status"
+    for delay in (3, 7):
+        time.sleep(delay)
+        try:
+            live = read_profile().get(key, "")
+        except Exception as exc:
+            log("verify read failed -> %s" % describe_error(exc))
+            return None
+        if live.replace("\r\n", "\n").strip() == expected.strip():
+            return True
+    return False
+
+
+def apply_field(user, field, text):
+    label = "bio" if field == "bio" else "wiwo"
+    if DRY_RUN or (user is None and not SESSION_ID):
+        log("dry-run %s(%d): %s" % (label, clen(text), text.replace("\n", " | ")))
+        return True
+    via = write_field(user, field, text)
+    if not via:
         return False
+    checked = verify_field(field, text)
+    if checked is False:
+        log("%s written via %s but profile still shows old text" % (label, via))
+        return False
+    log("%s written via %s (%d chars)%s" % (
+        label, via, clen(text), "" if checked is None else " verified"))
+    return True
 
 
 def run_once(state, user):
@@ -685,20 +752,25 @@ def run_once(state, user):
     status = build_status(ctx, now)
     stamp = time.time()
     wrote = []
+    failed = []
 
     if UPDATE_BIO:
         bio = build_bio(ctx, now)
         if bio != state.get("last_bio") or stamp - state.get("last_bio_at", 0) > MIN_REFRESH:
-            if set_bio(user, bio):
+            if apply_field(user, "bio", bio):
                 state["last_bio"] = bio
                 state["last_bio_at"] = stamp
                 wrote.append("bio=%d" % clen(bio))
+            else:
+                failed.append("bio")
 
     if status != state.get("last_status") or stamp - state.get("last_status_at", 0) > MIN_REFRESH:
-        if set_status(user, status):
+        if apply_field(user, "status", status):
             state["last_status"] = status
             state["last_status_at"] = stamp
             wrote.append("wiwo=%d" % clen(status))
+        else:
+            failed.append("wiwo")
 
     if ctx.get("followers") is not None:
         state["followers"] = ctx["followers"]
@@ -706,8 +778,12 @@ def run_once(state, user):
     if latest:
         state["last_quake_id"] = latest.get("id", "")
 
-    log("updated %s" % " ".join(wrote) if wrote else "skip (no change)")
     save_state(state)
+    if failed:
+        log("FAILED to write: %s" % " ".join(failed))
+        return False
+    log("updated %s" % " ".join(wrote) if wrote else "no change to write")
+    return True
 
 
 def main_loop():
@@ -821,9 +897,16 @@ def main():
         raise SystemExit(0 if run_offline_tests() else 1)
     if args.once:
         state = load_state()
-        user = None if DRY_RUN else get_scratch_user()
-        run_once(state, user)
-        return
+        user = None
+        if not DRY_RUN:
+            try:
+                user = get_scratch_user()
+                log("scratchattach login ok")
+            except Exception as exc:
+                log("scratchattach login failed -> %s" % describe_error(exc))
+                log("falling back to direct site-api write")
+        ok = run_once(state, user)
+        raise SystemExit(0 if ok else 1)
     main_loop()
 
 
