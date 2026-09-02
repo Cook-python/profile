@@ -1,0 +1,63 @@
+name: update-profile
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "1 にすると書き込みせずログだけ出します"
+        required: false
+        default: "0"
+
+concurrency:
+  group: update-profile
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore state
+        run: |
+          git fetch origin +refs/heads/bot-state:refs/remotes/origin/bot-state --depth=1 || true
+          git show origin/bot-state:state.json > state.json 2>/dev/null || echo '{}' > state.json
+          echo "state bytes: $(wc -c < state.json)"
+
+      - name: Update profile
+        env:
+          SCRATCH_SESSION_ID: ${{ secrets.SCRATCH_SESSION_ID }}
+          SCRATCH_USERNAME: weather_sunny
+          JMA_AREA_CODE: "130000"
+          AREA_LABEL: 東京
+          LATITUDE: "35.68"
+          LONGITUDE: "139.77"
+          BIO_FIXED: 天気と防災が好きです
+          MIN_REFRESH: "1800"
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+        run: python main.py --once
+
+      - name: Save state
+        if: always()
+        run: |
+          test -s state.json || exit 0
+          git config user.name "profile-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BLOB=$(git hash-object -w state.json)
+          TREE=$(printf '100644 blob %s\tstate.json\n' "$BLOB" | git mktree)
+          COMMIT=$(git commit-tree "$TREE" -m "state $(date -u +%Y-%m-%dT%H:%M:%SZ)")
+          git push -f origin "$COMMIT:refs/heads/bot-state"
