@@ -46,7 +46,12 @@ jobs:
           AREA_LABEL: 東京
           LATITUDE: "35.68"
           LONGITUDE: "139.77"
-          BIO_FIXED: ペンをガチャガチャいじってますぅ
+          BIO_FIXED: 天気と防災が好きです
+          NOTICE_TEXT: pythonによって自動更新されています
+          PRESENCE_WINDOW: "900"
+          PRESENCE_ONLINE: オンライン
+          PRESENCE_OFFLINE: オフライン
+          UPDATE_BIO: "0"
           MIN_REFRESH: "1800"
           DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
         run: python main.py --once
