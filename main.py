@@ -1,6 +1,5 @@
 import os
 import re
-import ssl
 import json
 import math
 import time
@@ -17,11 +16,6 @@ except Exception:
     sa = None
 
 try:
-    import websocket as wsclient
-except Exception:
-    wsclient = None
-
-try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
@@ -35,13 +29,19 @@ AREA_LABEL = os.environ.get("AREA_LABEL", "東京")
 LAT = float(os.environ.get("LATITUDE", "35.68"))
 LON = float(os.environ.get("LONGITUDE", "139.77"))
 BIO_FIXED = os.environ.get("BIO_FIXED", "天気と防災が好きです")
+NOTICE_TEXT = os.environ.get("NOTICE_TEXT", "pythonによって自動更新されています")
 STATE_PATH = os.environ.get("STATE_PATH", "state.json")
 LOOP_SECONDS = int(os.environ.get("LOOP_SECONDS", "60"))
 MIN_REFRESH = int(os.environ.get("MIN_REFRESH", "1800"))
+PRESENCE_WINDOW = int(os.environ.get("PRESENCE_WINDOW", "900"))
+PRESENCE_ONLINE = os.environ.get("PRESENCE_ONLINE", "オンライン")
+PRESENCE_OFFLINE = os.environ.get("PRESENCE_OFFLINE", "オフライン")
+UPDATE_BIO = os.environ.get("UPDATE_BIO", "0") == "1"
+NEWLINE_COST = int(os.environ.get("NEWLINE_COST", "2"))
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 
 PROFILE_LIMIT = 200
-SEP = " / "
+SEP = "\n"
 TZ = datetime.timezone(datetime.timedelta(hours=9))
 UA = "scratch-profile-bot/1.0 (+https://scratch.mit.edu/users/%s/)" % USERNAME
 
@@ -50,12 +50,9 @@ WARNING_URL = "https://www.jma.go.jp/bosai/warning/data/warning/%s.json" % AREA_
 OPENMETEO_URL = "https://api.open-meteo.com/v1/forecast"
 QUAKE_URL = "https://api.p2pquake.net/v2/history?codes=551&limit=30"
 TSUNAMI_URL = "https://api.p2pquake.net/v2/history?codes=552&limit=1"
-SCRATCH_USER_URL = "https://api.scratch.mit.edu/users/%s/" % USERNAME
 SCRATCH_FOLLOWERS_URL = "https://api.scratch.mit.edu/users/%s/followers/?limit=1" % USERNAME
 SCRATCH_MESSAGES_URL = "https://api.scratch.mit.edu/users/%s/messages/count/" % USERNAME
 SCRATCH_PROJECTS_URL = "https://api.scratch.mit.edu/users/%s/projects/" % USERNAME
-CLOUD_WS_SCRATCH = "wss://clouddata.scratch.mit.edu"
-CLOUD_WS_TURBOWARP = "wss://clouddata.turbowarp.org"
 
 WARNING_NAMES = {
     "02": "暴風雪警報", "03": "大雨警報", "04": "洪水警報", "05": "暴風警報",
@@ -89,25 +86,28 @@ def clen(text):
     return len(text or "")
 
 
+def budget_len(text):
+    text = text or ""
+    return len(text) + text.count("\n") * (NEWLINE_COST - 1)
+
+
 def assemble(blocks, limit=PROFILE_LIMIT, sep=SEP):
     items = [b for b in blocks if b.get("t")]
     while True:
         text = sep.join(b["t"] for b in items)
-        if clen(text) <= limit:
+        if budget_len(text) <= limit:
             return text
         droppable = [b for b in items if b.get("p", 1) > 0]
         if not droppable:
             return text[:limit]
-        worst = max(droppable, key=lambda b: b.get("p", 1))
-        items.remove(worst)
+        items.remove(max(droppable, key=lambda b: b.get("p", 1)))
 
 
 def compact(text):
     if not text:
         return ""
     text = re.sub(r"\s+", "", str(text))
-    text = text.replace("後", "のち").replace("一時", "時々")
-    return text
+    return text.replace("後", "のち").replace("一時", "時々")
 
 
 def short_number(n):
@@ -296,15 +296,6 @@ def fetch_tsunami():
     return {"active": bool(label), "grade": label, "areas": len(grades)}
 
 
-def fetch_scratch_user():
-    data = get_json(SCRATCH_USER_URL)
-    return {
-        "id": data.get("id"),
-        "joined": (data.get("history") or {}).get("joined", ""),
-        "country": (data.get("profile") or {}).get("country", ""),
-    }
-
-
 def fetch_followers_count():
     try:
         res = HTTP.get("https://scratch.mit.edu/users/%s/followers/" % USERNAME,
@@ -341,8 +332,17 @@ def fetch_messages_count():
     return int(data.get("count", 0))
 
 
+def parse_scratch_time(value):
+    if not value:
+        return 0.0
+    try:
+        return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
 def fetch_projects_stats():
-    total = {"views": 0, "loves": 0, "favorites": 0, "count": 0}
+    total = {"views": 0, "loves": 0, "favorites": 0, "count": 0, "last_modified": 0.0}
     offset = 0
     while offset < 120:
         data = get_json("%s?limit=40&offset=%d" % (SCRATCH_PROJECTS_URL, offset))
@@ -354,31 +354,23 @@ def fetch_projects_stats():
             total["loves"] += int(st.get("loves", 0))
             total["favorites"] += int(st.get("favorites", 0))
             total["count"] += 1
+            hist = p.get("history") or {}
+            for key in ("modified", "shared", "created"):
+                ts = parse_scratch_time(hist.get(key))
+                if ts > total["last_modified"]:
+                    total["last_modified"] = ts
         if len(data) < 40:
             break
         offset += 40
     return total
 
 
-def check_ws(url):
-    if wsclient is None:
-        return False
-    try:
-        conn = wsclient.create_connection(
-            url,
-            timeout=6,
-            origin="https://scratch.mit.edu",
-            header=["User-Agent: %s" % UA],
-            sslopt={"cert_reqs": ssl.CERT_NONE},
-        )
-        conn.close()
-        return True
-    except Exception:
-        return False
-
-
-def fetch_cloud_status():
-    return {"scratch": check_ws(CLOUD_WS_SCRATCH), "turbowarp": check_ws(CLOUD_WS_TURBOWARP)}
+def presence_text(ts, now_ts):
+    if not ts:
+        return PRESENCE_OFFLINE
+    if now_ts - float(ts) <= PRESENCE_WINDOW:
+        return PRESENCE_ONLINE
+    return PRESENCE_OFFLINE
 
 
 def jd_to_local(jd):
@@ -404,8 +396,7 @@ def sun_times(date, lat=LAT, lon=LON):
 
 def moon_info(now_utc):
     ref = datetime.datetime(2000, 1, 6, 18, 14, tzinfo=datetime.timezone.utc)
-    days = (now_utc - ref).total_seconds() / 86400.0
-    age = days % 29.530588853
+    age = ((now_utc - ref).total_seconds() / 86400.0) % 29.530588853
     idx = int((age / 29.530588853) * 8 + 0.5) % 8
     return age, MOON_NAMES[idx]
 
@@ -442,75 +433,117 @@ def emergency_text(warn, tsunami, quake):
     if tsunami and tsunami.get("active"):
         parts.append("【%s】直ちに高台へ" % tsunami["grade"])
     if warn and warn.get("special"):
-        names = "・".join(WARNING_NAMES[c] for c in warn["special"])
-        parts.append("【%s】命を守る行動を" % names)
+        parts.append("【%s】命を守る行動を" % "・".join(WARNING_NAMES[c] for c in warn["special"]))
     if quake_is_major(quake):
         q = quake["latest"]
         parts.append("【最大震度%s】%s M%s" % (scale_label(q["scale"]), q["place"], q["mag"]))
     return parts
 
 
-def weather_blocks(fc, om):
-    blocks = []
-    if fc and fc.get("weather"):
-        blocks.append({"t": "%s %s" % (AREA_LABEL, fc["weather"][:14]), "p": 1})
-    temp = None
-    if om and om.get("temp") is not None:
-        temp = "%.1f℃" % float(om["temp"])
-    elif fc and fc.get("temp_max") is not None:
-        temp = "最高%d℃" % fc["temp_max"]
-    if temp:
-        blocks.append({"t": temp, "p": 1})
-    if fc and fc.get("pop") is not None:
-        blocks.append({"t": "降水%d%%" % fc["pop"], "p": 2})
-    if om and om.get("rain_in") is not None:
-        blocks.append({"t": "約%d分後に雨" % om["rain_in"], "p": 2})
-    elif om and om.get("rain_soon", 0) >= 0.2:
-        blocks.append({"t": "1h雨量%.1fmm" % om["rain_soon"], "p": 3})
-    return blocks
-
-
-def warning_block(warn):
-    if not warn:
-        return None
-    if warn.get("special"):
-        return {"t": "【%s】" % "・".join(WARNING_NAMES[c] for c in warn["special"]), "p": 0}
-    if warn.get("alert"):
-        return {"t": "【%s】" % "・".join(WARNING_NAMES[c] for c in warn["alert"]), "p": 0}
-    if warn.get("advisory"):
-        return {"t": "・".join(WARNING_NAMES[c] for c in warn["advisory"][:2]), "p": 2}
-    return None
-
-
 def rotation_blocks(ctx, now):
     subs = []
     sun = ctx.get("sun") or (None, None)
     if sun[0] and sun[1]:
-        subs.append("日出%s 日入%s" % (sun[0].strftime("%H:%M"), sun[1].strftime("%H:%M")))
+        subs.append("日出:%s 日入:%s" % (sun[0].strftime("%H:%M"), sun[1].strftime("%H:%M")))
     moon = ctx.get("moon")
     if moon:
-        subs.append("月齢%.1f %s" % (moon[0], moon[1]))
-    quake = ctx.get("quake") or {}
-    subs.append("本日の有感地震%d回" % quake.get("count_today", 0))
+        subs.append("月齢:%.1f %s" % (moon[0], moon[1]))
+    subs.append("本日の有感地震:%d回" % (ctx.get("quake") or {}).get("count_today", 0))
     followers = ctx.get("followers")
     fdiff = ctx.get("follower_diff")
     if followers is not None:
         if fdiff:
-            subs.append("フォロワー%d(%+d)" % (followers, fdiff))
+            subs.append("フォロワー:%d(%+d)" % (followers, fdiff))
         else:
-            subs.append("フォロワー%d" % followers)
+            subs.append("フォロワー:%d" % followers)
     vdiff = ctx.get("view_diff")
     if vdiff:
-        subs.append("24h再生+%d" % vdiff)
+        subs.append("24h再生:+%d" % vdiff)
     picked = []
     new_follower = ctx.get("new_follower")
     if new_follower:
-        picked.append("新フォロワー @%s" % new_follower)
+        picked.append("新フォロワー:@%s" % new_follower)
     if subs:
         idx = (now.hour * 60 + now.minute) // 5
         picked.append(subs[idx % len(subs)])
         picked.append(subs[(idx + 1) % len(subs)])
     return picked
+
+
+def build_status(ctx, now):
+    stamp = "更新:%s" % now.strftime("%m/%d %H:%M")
+    notice = {"t": NOTICE_TEXT, "p": 1}
+    emerg = ctx.get("emergency") or []
+
+    if emerg:
+        blocks = [{"t": emerg[0], "p": 0}]
+        for e in emerg[1:]:
+            blocks.append({"t": e, "p": 1})
+        quake = (ctx.get("quake") or {}).get("latest")
+        if quake:
+            blocks.append({"t": "地震:%s %s M%s 深さ%skm" % (
+                quake["time"][5:16], quake["place"], quake["mag"], quake["depth"]), "p": 3})
+        blocks.append({"t": stamp, "p": 0})
+        blocks.append(notice)
+        return assemble(blocks)
+
+    blocks = [{"t": BIO_FIXED, "p": 0}]
+
+    stats = ctx.get("projects")
+    if stats and stats.get("count"):
+        blocks.append({"t": "作品:%d 閲覧:%s 好き:%s 星:%s" % (
+            stats["count"], short_number(stats["views"]),
+            short_number(stats["loves"]), short_number(stats["favorites"])), "p": 0})
+
+    if ctx.get("active_text"):
+        blocks.append({"t": "状態:%s" % ctx["active_text"], "p": 0})
+
+    if ctx.get("messages"):
+        blocks.append({"t": "未読:%d" % ctx["messages"], "p": 11})
+
+    fc = ctx.get("forecast") or {}
+    om = ctx.get("openmeteo") or {}
+    if fc.get("weather"):
+        blocks.append({"t": "天気:%s %s" % (AREA_LABEL, fc["weather"][:14]), "p": 2})
+
+    warn = ctx.get("warning") or {}
+    if warn.get("special"):
+        blocks.append({"t": "【%s】" % "・".join(WARNING_NAMES[c] for c in warn["special"]), "p": 0})
+    elif warn.get("alert"):
+        blocks.append({"t": "【%s】" % "・".join(WARNING_NAMES[c] for c in warn["alert"]), "p": 0})
+    elif warn.get("advisory"):
+        blocks.append({"t": "注意:%s" % "・".join(WARNING_NAMES[c] for c in warn["advisory"][:2]), "p": 6})
+
+    line = []
+    if om.get("temp") is not None:
+        line.append("気温:%.1f℃" % float(om["temp"]))
+    elif fc.get("temp_max") is not None:
+        line.append("最高:%d℃" % fc["temp_max"])
+    if fc.get("pop") is not None:
+        line.append("降水:%d%%" % fc["pop"])
+    if line:
+        blocks.append({"t": " ".join(line), "p": 3})
+
+    if om.get("rain_in") is not None:
+        blocks.append({"t": "雨:約%d分後" % om["rain_in"], "p": 5})
+    elif om.get("rain_soon", 0) >= 0.2:
+        blocks.append({"t": "1h雨量:%.1fmm" % om["rain_soon"], "p": 7})
+
+    tsunami = ctx.get("tsunami") or {}
+    if tsunami.get("active"):
+        blocks.append({"t": "【%s】" % tsunami["grade"], "p": 0})
+
+    quake = (ctx.get("quake") or {}).get("latest")
+    if quake:
+        blocks.append({"t": "地震:%s %s 震度%s M%s" % (
+            quake["time"][5:16], quake["place"], scale_label(quake["scale"]), quake["mag"]), "p": 4})
+
+    for i, sub in enumerate(rotation_blocks(ctx, now)):
+        blocks.append({"t": sub, "p": 8 + i * 2})
+
+    blocks.append({"t": stamp, "p": 0})
+    blocks.append(notice)
+    return assemble(blocks)
 
 
 def build_bio(ctx, now):
@@ -521,55 +554,13 @@ def build_bio(ctx, now):
             blocks.append({"t": e, "p": 1})
         blocks.append({"t": BIO_FIXED, "p": 3})
         return assemble(blocks)
+    fc = ctx.get("forecast") or {}
+    om = ctx.get("openmeteo") or {}
     blocks = [{"t": BIO_FIXED, "p": 0}]
-    wx = weather_blocks(ctx.get("forecast"), ctx.get("openmeteo"))
-    if wx:
-        blocks.append(wx[0])
-    wb = warning_block(ctx.get("warning"))
-    if wb:
-        blocks.append(wb)
-    blocks.extend(wx[1:])
-    return assemble(blocks)
-
-
-def build_status(ctx, now):
-    emerg = ctx.get("emergency") or []
-    stamp = "更新%s" % now.strftime("%m/%d %H:%M")
-    if emerg:
-        blocks = [{"t": emerg[0], "p": 0}]
-        for e in emerg[1:]:
-            blocks.append({"t": e, "p": 1})
-        quake = (ctx.get("quake") or {}).get("latest")
-        if quake:
-            blocks.append({"t": "%s %s M%s 深さ%skm" % (
-                quake["time"][5:16], quake["place"], quake["mag"], quake["depth"]), "p": 2})
-        blocks.append({"t": stamp, "p": 0})
-        return assemble(blocks)
-
-    blocks = []
-    tsunami = ctx.get("tsunami") or {}
-    if tsunami.get("active"):
-        blocks.append({"t": "【%s】" % tsunami["grade"], "p": 0})
-    quake = (ctx.get("quake") or {}).get("latest")
-    if quake:
-        blocks.append({"t": "地震%s %s 震度%s M%s" % (
-            quake["time"][5:16], quake["place"], scale_label(quake["scale"]), quake["mag"]), "p": 1})
-    stats = ctx.get("projects")
-    if stats and stats.get("count"):
-        blocks.append({"t": "作品%d 閲覧%s 好き%s 星%s" % (
-            stats["count"], short_number(stats["views"]),
-            short_number(stats["loves"]), short_number(stats["favorites"])), "p": 2})
-    msgs = ctx.get("messages")
-    if msgs:
-        blocks.append({"t": "未読%d" % msgs, "p": 4})
-    cloud = ctx.get("cloud") or {}
-    if cloud:
-        blocks.append({"t": "SC%s TW%s" % (
-            "接続済" if cloud.get("scratch") else "切断",
-            "接続済" if cloud.get("turbowarp") else "切断"), "p": 5})
-    for i, sub in enumerate(rotation_blocks(ctx, now)):
-        blocks.append({"t": sub, "p": 3 + i})
-    blocks.append({"t": stamp, "p": 0})
+    if fc.get("weather"):
+        blocks.append({"t": "天気:%s %s" % (AREA_LABEL, fc["weather"][:14]), "p": 1})
+    if om.get("temp") is not None:
+        blocks.append({"t": "気温:%.1f℃" % float(om["temp"]), "p": 2})
     return assemble(blocks)
 
 
@@ -582,7 +573,6 @@ def collect(state, now):
     ctx["tsunami"] = guarded("tsunami", 60, fetch_tsunami, {})
     ctx["messages"] = guarded("messages", 300, fetch_messages_count, 0)
     ctx["projects"] = guarded("projects", 900, fetch_projects_stats, {})
-    ctx["cloud"] = guarded("cloud", 900, fetch_cloud_status, {})
     ctx["latest_follower"] = guarded("follower", 300, fetch_latest_follower, "")
     ctx["followers"] = guarded("followers", 600, fetch_followers_count, state.get("followers"))
 
@@ -597,20 +587,34 @@ def collect(state, now):
 
     views = (ctx.get("projects") or {}).get("views")
     base = state.get("views_base")
-    base_at = state.get("views_base_at", 0)
     if views is not None:
-        if base is None or time.time() - base_at > 86400:
+        if base is None or time.time() - state.get("views_base_at", 0) > 86400:
             state["views_base"] = views
             state["views_base_at"] = time.time()
             ctx["view_diff"] = 0
         else:
             ctx["view_diff"] = max(0, views - base)
 
+    now_ts = time.time()
+    last_active = float(state.get("last_active_at", 0) or 0)
+    msgs = ctx.get("messages")
+    prev_msgs = state.get("messages_prev")
+    if msgs is not None:
+        if prev_msgs is not None and msgs < prev_msgs:
+            last_active = now_ts
+        state["messages_prev"] = msgs
+    proj_modified = float((ctx.get("projects") or {}).get("last_modified", 0) or 0)
+    if proj_modified > last_active:
+        last_active = proj_modified
+    if last_active:
+        state["last_active_at"] = last_active
+    ctx["active_text"] = presence_text(last_active, now_ts)
+
     latest = ctx.get("latest_follower")
     if latest and latest != state.get("last_follower"):
         state["last_follower"] = latest
-        state["new_follower_at"] = time.time()
-    if state.get("new_follower_at") and time.time() - state["new_follower_at"] <= 600:
+        state["new_follower_at"] = now_ts
+    if state.get("new_follower_at") and now_ts - state["new_follower_at"] <= 600:
         ctx["new_follower"] = state.get("last_follower")
 
     ctx["emergency"] = emergency_text(ctx.get("warning"), ctx.get("tsunami"), ctx.get("quake"))
@@ -650,7 +654,7 @@ def get_scratch_user():
 
 def set_bio(user, text):
     if DRY_RUN or user is None:
-        log("dry-run bio(%d): %s" % (clen(text), text))
+        log("dry-run bio(%d): %s" % (clen(text), text.replace("\n", " | ")))
         return True
     try:
         user.set_bio(text)
@@ -662,7 +666,7 @@ def set_bio(user, text):
 
 def set_status(user, text):
     if DRY_RUN or user is None:
-        log("dry-run wiwo(%d): %s" % (clen(text), text))
+        log("dry-run wiwo(%d): %s" % (clen(text), text.replace("\n", " | ")))
         return True
     try:
         try:
@@ -678,16 +682,18 @@ def set_status(user, text):
 def run_once(state, user):
     now = datetime.datetime.now(TZ).replace(second=0, microsecond=0)
     ctx = collect(state, now)
-    bio = build_bio(ctx, now)[:PROFILE_LIMIT]
-    status = build_status(ctx, now)[:PROFILE_LIMIT]
+    status = build_status(ctx, now)
     stamp = time.time()
-
     wrote = []
-    if bio != state.get("last_bio") or stamp - state.get("last_bio_at", 0) > MIN_REFRESH:
-        if set_bio(user, bio):
-            state["last_bio"] = bio
-            state["last_bio_at"] = stamp
-            wrote.append("bio=%d" % clen(bio))
+
+    if UPDATE_BIO:
+        bio = build_bio(ctx, now)
+        if bio != state.get("last_bio") or stamp - state.get("last_bio_at", 0) > MIN_REFRESH:
+            if set_bio(user, bio):
+                state["last_bio"] = bio
+                state["last_bio_at"] = stamp
+                wrote.append("bio=%d" % clen(bio))
+
     if status != state.get("last_status") or stamp - state.get("last_status_at", 0) > MIN_REFRESH:
         if set_status(user, status):
             state["last_status"] = status
@@ -721,15 +727,13 @@ def main_loop():
         time.sleep(LOOP_SECONDS)
 
 
-DUMMY_FORECAST = {"weather": "晴れ時々くもり", "pop": 30, "temp_max": 31, "temp_min": 24}
-DUMMY_OM = {"temp": 28.4, "rain_soon": 0.0, "rain_in": None}
-DUMMY_PROJECTS = {"views": 12840, "loves": 962, "favorites": 731, "count": 18}
+DUMMY_PROJECTS = {"views": 12840, "loves": 962, "favorites": 731, "count": 18, "last_modified": 0.0}
 
 
 def dummy_ctx(mode, now):
     ctx = {
-        "forecast": dict(DUMMY_FORECAST),
-        "openmeteo": dict(DUMMY_OM),
+        "forecast": {"weather": "晴れ時々くもり", "pop": 30, "temp_max": 31, "temp_min": 24},
+        "openmeteo": {"temp": 28.4, "rain_soon": 0.0, "rain_in": None},
         "warning": {"special": [], "alert": [], "advisory": ["14", "21"]},
         "quake": {"latest": {
             "id": "x1", "time": "2026/09/02 03:11:00", "place": "茨城県沖",
@@ -737,7 +741,7 @@ def dummy_ctx(mode, now):
         "tsunami": {"active": False, "grade": "", "areas": 0},
         "projects": dict(DUMMY_PROJECTS),
         "messages": 7,
-        "cloud": {"scratch": True, "turbowarp": True},
+        "active_text": PRESENCE_ONLINE,
         "followers": 1284,
         "follower_diff": 3,
         "view_diff": 126,
@@ -762,7 +766,9 @@ def dummy_ctx(mode, now):
             "place": "三陸沖および北海道南西沖から東北地方太平洋沿岸",
             "mag": 8.4, "depth": 10, "scale": 70}, "count_today": 137}
         ctx["tsunami"] = {"active": True, "grade": "大津波警報", "areas": 22}
-        ctx["projects"] = {"views": 98765432, "loves": 1234567, "favorites": 987654, "count": 999}
+        ctx["projects"] = {"views": 98765432, "loves": 1234567, "favorites": 987654,
+                           "count": 999, "last_modified": 0.0}
+        ctx["active_text"] = PRESENCE_OFFLINE
         ctx["new_follower"] = "very_long_scratch_user_name_2026"
     if mode == "quake":
         ctx["quake"] = {"latest": {
@@ -773,37 +779,35 @@ def dummy_ctx(mode, now):
     return ctx
 
 
+EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF←-⯿☀-➿️]")
+
+
 def run_offline_tests():
     now = datetime.datetime(2026, 9, 2, 14, 35, tzinfo=TZ)
     failures = 0
     cases = (("normal", "平常時"), ("warning", "警報時"), ("quake", "地震発生時"), ("stress", "過負荷テスト"))
     for mode, label in cases:
         ctx = dummy_ctx(mode, now)
-        bio = build_bio(ctx, now)
-        status = build_status(ctx, now)
-        print("=== %s ===" % label)
-        print("[私について] %d文字" % clen(bio))
-        print(bio)
-        print("[私が取り組んでいること] %d文字" % clen(status))
-        print(status)
+        text = build_status(ctx, now)
+        print("=== %s === %d文字 (改行2文字換算で%d)" % (label, clen(text), budget_len(text)))
+        print(text)
         print("")
-        for name, text in (("bio", bio), ("wiwo", status)):
-            if clen(text) > PROFILE_LIMIT:
-                failures += 1
-                print("NG %s %s %d文字" % (label, name, clen(text)))
-            if re.search(r"[\U0001F000-\U0001FAFF☀-➿️⬀-⯿]", text):
-                failures += 1
-                print("NG emoji found in %s %s" % (label, name))
+        if budget_len(text) > PROFILE_LIMIT:
+            failures += 1
+            print("NG %s が上限超過" % label)
+        if EMOJI_RE.search(text):
+            failures += 1
+            print("NG %s に絵文字" % label)
+        if NOTICE_TEXT not in text:
+            failures += 1
+            print("NG %s に注意書きなし" % label)
 
     for i in range(0, 1440, 5):
         t = datetime.datetime(2026, 9, 2, 0, 0, tzinfo=TZ) + datetime.timedelta(minutes=i)
         for mode, _ in cases:
-            c = dummy_ctx(mode, t)
-            for text in (build_bio(c, t), build_status(c, t)):
-                if clen(text) > PROFILE_LIMIT:
-                    failures += 1
-                if re.search(r"[\U0001F000-\U0001FAFF☀-➿️⬀-⯿]", text):
-                    failures += 1
+            text = build_status(dummy_ctx(mode, t), t)
+            if budget_len(text) > PROFILE_LIMIT or EMOJI_RE.search(text) or NOTICE_TEXT not in text:
+                failures += 1
     print("全時刻スイープ(288刻み x 4パターン): %s" % ("OK" if failures == 0 else "NG %d" % failures))
     return failures == 0
 
