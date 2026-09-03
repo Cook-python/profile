@@ -443,8 +443,17 @@ def emergency_text(warn, tsunami, quake):
     return parts
 
 
+def quake_when(quake, now):
+    t = quake.get("time", "")
+    if t[:10] == now.strftime("%Y/%m/%d"):
+        return t[11:16]
+    return t[5:16]
+
+
 def rotation_blocks(ctx, now):
     subs = []
+    if ctx.get("latest_follower"):
+        subs.append("直近のフォロワー:@%s" % ctx["latest_follower"])
     sun = ctx.get("sun") or (None, None)
     if sun[0] and sun[1]:
         subs.append("日出:%s 日入:%s" % (sun[0].strftime("%H:%M"), sun[1].strftime("%H:%M")))
@@ -463,9 +472,8 @@ def rotation_blocks(ctx, now):
     if vdiff:
         subs.append("24h再生:+%d" % vdiff)
     picked = []
-    new_follower = ctx.get("new_follower")
-    if new_follower:
-        picked.append("新フォロワー:@%s" % new_follower)
+    if ctx.get("new_follower"):
+        picked.append("新しくフォローされました")
     if subs:
         idx = (now.hour * 60 + now.minute) // 5
         picked.append(subs[idx % len(subs)])
@@ -485,7 +493,7 @@ def build_status(ctx, now):
         quake = (ctx.get("quake") or {}).get("latest")
         if quake:
             blocks.append({"t": "地震:%s %s M%s 深さ%skm" % (
-                quake["time"][5:16], quake["place"], quake["mag"], quake["depth"]), "p": 3})
+                quake_when(quake, now), quake["place"], quake["mag"], quake["depth"]), "p": 3})
         blocks.append({"t": stamp, "p": 0})
         blocks.append(notice)
         return assemble(blocks)
@@ -539,7 +547,7 @@ def build_status(ctx, now):
     quake = (ctx.get("quake") or {}).get("latest")
     if quake:
         blocks.append({"t": "地震:%s %s 震度%s M%s" % (
-            quake["time"][5:16], quake["place"], scale_label(quake["scale"]), quake["mag"]), "p": 4})
+            quake_when(quake, now), quake["place"], scale_label(quake["scale"]), quake["mag"]), "p": 4})
 
     for i, sub in enumerate(rotation_blocks(ctx, now)):
         blocks.append({"t": sub, "p": 8 + i * 2})
@@ -821,6 +829,7 @@ def dummy_ctx(mode, now):
         "followers": 1284,
         "follower_diff": 3,
         "view_diff": 126,
+        "latest_follower": "sunny_dev",
         "new_follower": "sunny_dev",
         "sun": sun_times(now.date()),
         "moon": moon_info(now.astimezone(datetime.timezone.utc)),
@@ -845,6 +854,7 @@ def dummy_ctx(mode, now):
         ctx["projects"] = {"views": 98765432, "loves": 1234567, "favorites": 987654,
                            "count": 999, "last_modified": 0.0}
         ctx["active_text"] = PRESENCE_OFFLINE
+        ctx["latest_follower"] = "very_long_scratch_user_name_2026"
         ctx["new_follower"] = "very_long_scratch_user_name_2026"
     if mode == "quake":
         ctx["quake"] = {"latest": {
